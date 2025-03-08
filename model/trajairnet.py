@@ -1,158 +1,176 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
+import math
 
 from model.tcn_model import TemporalConvNet
 from model.gat_model import GAT
 from model.cvae_base import CVAE
 from model.utils import acc_to_abs
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
 
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
 
-
-class TrajAirNet(nn.Module):
+class SGTN(nn.Module):
     def __init__(self, args):
-        super(TrajAirNet, self).__init__()
-
-        input_size = args.input_channels
-        n_classes = int(args.preds/args.preds_step)
-        num_channels= [args.tcn_channel_size]*args.tcn_layers
-        num_channels.append(n_classes)
-        tcn_kernel_size = args.tcn_kernels
-        dropout = args.dropout
+        super(SGTN, self).__init__()
         
-        graph_hidden = args.graph_hidden
-        gat_in = n_classes*args.obs+args.num_context_output_c
-        gat_out = n_classes*args.obs+args.num_context_output_c
-        n_heads = args.gat_heads 
-        alpha = args.alpha
+        # Model dimensions
+        self.input_size = args.input_channels
+        self.n_classes = int(args.preds/args.preds_step)
+        self.d_model = args.transformer_dim  # Transformer dimension
+        self.nhead = args.transformer_heads  # Number of attention heads
+        self.num_encoder_layers = args.transformer_layers
+        self.dim_feedforward = args.transformer_ff_dim
+        self.dropout = args.dropout
         
-        cvae_encoder = [n_classes*n_classes]
-        for layer in range(args.cvae_layers):
-            cvae_encoder.append(args.cvae_channel_size)
-        cvae_decoder = [args.cvae_channel_size]*args.cvae_layers
-        cvae_decoder.append(input_size*args.mlp_layer)
-
-     
-
-        self.tcn_encoder_x = TemporalConvNet(input_size, num_channels, kernel_size=tcn_kernel_size, dropout=dropout)
-        self.tcn_encoder_y = TemporalConvNet(input_size, num_channels, kernel_size=tcn_kernel_size, dropout=dropout)
-        self.cvae = CVAE(encoder_layer_sizes = cvae_encoder,latent_size = args.cvae_hidden, decoder_layer_sizes =cvae_decoder,conditional=True, num_labels= gat_out+gat_in)
-        self.gat = GAT( nin=gat_in, nhid = graph_hidden, nout = gat_out, alpha = alpha, nheads = n_heads)
-        self.linear_decoder = nn.Linear(args.mlp_layer,n_classes)
-        self.context_conv = nn.Conv1d(in_channels=args.num_context_input_c, out_channels=1, kernel_size=args.cnn_kernels)
-        self.context_linear = nn.Linear(args.obs-1,args.num_context_output_c)
-        self.relu = nn.ReLU()
+        # Spatial encoding (GNN) parameters
+        self.graph_hidden = args.graph_hidden
+        self.gat_heads = args.gat_heads
+        self.alpha = args.alpha
+        
+        # Feature embedding layers
+        self.input_embedding = nn.Linear(self.input_size, self.d_model)
+        self.pos_encoder = PositionalEncoding(self.d_model)
+        
+        # Temporal Transformer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=self.nhead,
+            dim_feedforward=self.dim_feedforward,
+            dropout=self.dropout,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=self.num_encoder_layers
+        )
+        
+        # Spatial Graph Neural Network
+        self.gnn_layers = nn.ModuleList([
+            GraphAttentionLayer(
+                self.d_model if i == 0 else self.graph_hidden,
+                self.graph_hidden,
+                self.alpha,
+                self.gat_heads
+            ) for i in range(args.gnn_layers)
+        ])
+        
+        # Context processing
+        self.context_conv = nn.Conv1d(
+            in_channels=args.num_context_input_c,
+            out_channels=1,
+            kernel_size=args.cnn_kernels
+        )
+        self.context_linear = nn.Linear(args.obs-1, args.num_context_output_c)
+        
+        # Trajectory prediction layers
+        self.trajectory_predictor = nn.Sequential(
+            nn.Linear(self.graph_hidden + self.d_model, args.mlp_layer),
+            nn.ReLU(),
+            nn.Linear(args.mlp_layer, self.n_classes * self.input_size)
+        )
+        
+        # Uncertainty estimation
+        self.uncertainty_estimator = nn.Sequential(
+            nn.Linear(self.graph_hidden + self.d_model, args.mlp_layer),
+            nn.ReLU(),
+            nn.Linear(args.mlp_layer, self.n_classes * self.input_size * 2)  # Mean and variance
+        )
+        
         self.init_weights()
 
     def init_weights(self):
-        self.linear_decoder.weight.data.normal_(0, 0.05)
-        self.context_linear.weight.data.normal_(0, 0.05)
-        self.context_conv.weight.data.normal_(0, 0.1)
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+                
+    def forward(self, x, y, adj, context):
+        batch_size = x.size(2)
         
-    def forward(self, x, y, adj,context,sort=False):        
+        # Process each agent's trajectory
+        encoded_trajectories = []
+        encoded_contexts = []
         
-        encoded_trajectories_x = []
-        encoded_appended_trajectories_x = []
-        encoded_trajectories_y = []
+        for agent in range(batch_size):
+            # Extract and embed individual trajectory
+            traj = torch.transpose(x[:, :, agent][None, :, :], 1, 2)
+            traj_embedded = self.input_embedding(traj)
+            traj_embedded = self.pos_encoder(traj_embedded)
+            
+            # Temporal encoding with Transformer
+            temporal_encoding = self.transformer_encoder(traj_embedded)
+            
+            # Process context information
+            c = torch.transpose(context[:, :, agent][None, :, :], 1, 2)
+            context_features = self.context_conv(c)
+            context_features = F.relu(self.context_linear(context_features))
+            
+            encoded_trajectories.append(temporal_encoding)
+            encoded_contexts.append(context_features)
+            
+        # Stack encoded features
+        encoded_trajectories = torch.cat(encoded_trajectories, dim=0)
+        encoded_contexts = torch.cat(encoded_contexts, dim=0)
         
-        # pass all agents through encoder
-
-        for agent in range(x.shape[2]):
+        # Spatial encoding with GNN
+        spatial_features = encoded_trajectories
+        for gnn_layer in self.gnn_layers:
+            spatial_features = gnn_layer(spatial_features, adj)
             
-            x1 = torch.transpose(x[:,:, agent][None, :, :], 1, 2)
-            encoded_x = self.tcn_encoder_x(x1)
-            encoded_x = torch.flatten(encoded_x)[None,None,:]
-            encoded_trajectories_x.append(encoded_x)
-            
-            c1 = torch.transpose(context[:,:, agent][None, :, :], 1, 2)
-            encoded_context = self.context_conv(c1)
-            encoded_context = self.relu(self.context_linear(encoded_context))
-            
-            appended_x = torch.cat((encoded_x,encoded_context),dim=2)
-            encoded_appended_trajectories_x.append(appended_x)
-            
-            y1 = torch.transpose(y[:,:, agent][None, :, :], 1, 2)
-            encoded_y = self.tcn_encoder_y(y1)
-            encoded_y = torch.flatten(encoded_y)[None,None,:]
-            encoded_trajectories_y.append(encoded_y)
-
-        gat_input = torch.squeeze(torch.stack(encoded_appended_trajectories_x,dim=2))
+        # Combine spatial and temporal features
+        combined_features = torch.cat([spatial_features, encoded_contexts], dim=-1)
+        
+        # Predict trajectories and uncertainties
+        predicted_trajectories = self.trajectory_predictor(combined_features)
+        uncertainties = self.uncertainty_estimator(combined_features)
+        
+        # Reshape predictions
+        predicted_trajectories = predicted_trajectories.view(-1, self.n_classes, self.input_size)
+        means, log_vars = torch.chunk(uncertainties.view(-1, self.n_classes, self.input_size * 2), 2, dim=-1)
+        
+        return predicted_trajectories, means, log_vars
     
+    def inference(self, x, z, adj, context):
+        # Similar to forward pass but without uncertainty estimation
+        batch_size = x.size(2)
         
-        if len(gat_input.shape) == 1:
-            gat_input = torch.unsqueeze(gat_input,dim=0)
-
-        gat_output = self.gat(gat_input,adj)
-
-        recon_y = []
-        m = []
-        var = []
+        encoded_trajectories = []
+        encoded_contexts = []
         
-        # pass all agents through decoder
-        for agent in range(x.shape[2]):
+        for agent in range(batch_size):
+            traj = torch.transpose(x[:, :, agent][None, :, :], 1, 2)
+            traj_embedded = self.input_embedding(traj)
+            traj_embedded = self.pos_encoder(traj_embedded)
+            temporal_encoding = self.transformer_encoder(traj_embedded)
             
-            H_x = gat_output[agent].unsqueeze(0).unsqueeze(0)
-            H_xx = encoded_appended_trajectories_x[agent]
-            H_x = torch.cat((H_xx,H_x),dim=2)
-
-
-            H_y = encoded_trajectories_y[agent]
-            H_yy, means,log_var, z = self.cvae(H_y,H_x)
-
-            H_yy =  torch.reshape(H_yy, (3, -1))
-            recon_y_x = (self.linear_decoder(H_yy))
-            recon_y_x = torch.unsqueeze(recon_y_x,dim=0)
-            recon_y_x = acc_to_abs(recon_y_x,x[:,:,agent][:,:,None])    
-
-            recon_y.append(recon_y_x)
-            m.append(means)
-            var.append(log_var)
-        return recon_y,m,var
-    
-    
-    def inference(self,x,z,adj,context):
-     
-
-        encoded_trajectories_x = []
-        encoded_appended_trajectories_x = []
+            c = torch.transpose(context[:, :, agent][None, :, :], 1, 2)
+            context_features = self.context_conv(c)
+            context_features = F.relu(self.context_linear(context_features))
+            
+            encoded_trajectories.append(temporal_encoding)
+            encoded_contexts.append(context_features)
+            
+        encoded_trajectories = torch.cat(encoded_trajectories, dim=0)
+        encoded_contexts = torch.cat(encoded_contexts, dim=0)
         
-        # pass all agents through encoder
-        for agent in range(x.shape[2]):
-            x1 = torch.transpose(x[:,:, agent][None, :, :], 1, 2)
-            c1 = torch.transpose(context[:,:, agent][None, :, :], 1, 2)
-            encoded_context = self.context_conv(c1)
-            encoded_context = self.relu(self.context_linear(encoded_context))
-
-            encoded_x = self.tcn_encoder_x(x1)
-            encoded_x = torch.flatten(encoded_x)[None,None,:]
-            encoded_trajectories_x.append(encoded_x)
-            appended_x = torch.cat((encoded_x,encoded_context),dim=2)
-
-            encoded_appended_trajectories_x.append(appended_x)
-
-        gat_input = torch.squeeze(torch.stack(encoded_appended_trajectories_x,dim=2))
+        spatial_features = encoded_trajectories
+        for gnn_layer in self.gnn_layers:
+            spatial_features = gnn_layer(spatial_features, adj)
+            
+        combined_features = torch.cat([spatial_features, encoded_contexts], dim=-1)
+        predicted_trajectories = self.trajectory_predictor(combined_features)
+        predicted_trajectories = predicted_trajectories.view(-1, self.n_classes, self.input_size)
         
-        if len(gat_input.shape) == 1:
-            gat_input = torch.unsqueeze(gat_input,dim=0)
-        
-        gat_output = self.gat(gat_input,adj)
-        
-        recon_y = []
-        m = []
-        var = []
-        
-        # pass all agents through decoder
-        for agent in range(x.shape[2]):
-            H_x = (gat_output[agent].unsqueeze(0)).unsqueeze(0)
-            H_xx = encoded_appended_trajectories_x[agent]
-            H_x = torch.cat((H_xx,H_x),dim=2)
-            H_yy = self.cvae.inference(z,H_x)
-            H_yy =  torch.reshape(H_yy, (3, -1))
-
-            recon_y_x = (self.linear_decoder(H_yy)) 
-            recon_y_x = torch.unsqueeze(recon_y_x,dim=0)
-            recon_y_x = acc_to_abs(recon_y_x,x[:,:,agent][:,:,None])    
-
-            recon_y.append(recon_y_x.squeeze().detach())
-     
-        return recon_y
+        return predicted_trajectories
