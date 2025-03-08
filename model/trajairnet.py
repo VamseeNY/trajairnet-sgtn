@@ -2,9 +2,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import math
-
 from model.tcn_model import TemporalConvNet
 from model.gat_model import GAT
+from model.gat_layers import GraphAttentionLayer
 from model.cvae_base import CVAE
 from model.utils import acc_to_abs
 
