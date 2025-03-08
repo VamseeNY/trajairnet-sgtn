@@ -105,8 +105,7 @@ class SGTN(nn.Module):
         
         for agent in range(batch_size):
             # Extract and embed individual trajectory
-            traj = torch.transpose(x[:, :, agent][None, :, :], 1, 2)  # Shape: [1, T, F]
-            traj = traj.squeeze(0)  # Shape: [T, F]
+            traj = x[:, :, agent]  # Shape: [T, F]
             traj_embedded = self.input_embedding(traj)  # Shape: [T, D]
             traj_embedded = traj_embedded.unsqueeze(0)  # Shape: [1, T, D]
             traj_embedded = self.pos_encoder(traj_embedded)
@@ -116,7 +115,8 @@ class SGTN(nn.Module):
             temporal_encoding = temporal_encoding.mean(dim=1)  # Average over time dimension
             
             # Process context information
-            c = torch.transpose(context[:, :, agent][None, :, :], 1, 2)
+            c = context[:, :, agent].unsqueeze(0)  # Shape: [1, T, F]
+            c = c.transpose(1, 2)  # Shape: [1, F, T]
             context_features = self.context_conv(c)
             context_features = F.relu(self.context_linear(context_features))
             
@@ -153,15 +153,17 @@ class SGTN(nn.Module):
         encoded_contexts = []
         
         for agent in range(batch_size):
-            traj = torch.transpose(x[:, :, agent][None, :, :], 1, 2)
-            traj = traj.squeeze(0)
-            traj_embedded = self.input_embedding(traj)
-            traj_embedded = traj_embedded.unsqueeze(0)
+            # Extract and embed individual trajectory
+            traj = x[:, :, agent]  # Shape: [T, F]
+            traj_embedded = self.input_embedding(traj)  # Shape: [T, D]
+            traj_embedded = traj_embedded.unsqueeze(0)  # Shape: [1, T, D]
             traj_embedded = self.pos_encoder(traj_embedded)
             temporal_encoding = self.transformer_encoder(traj_embedded)
             temporal_encoding = temporal_encoding.mean(dim=1)
             
-            c = torch.transpose(context[:, :, agent][None, :, :], 1, 2)
+            # Process context information
+            c = context[:, :, agent].unsqueeze(0)  # Shape: [1, T, F]
+            c = c.transpose(1, 2)  # Shape: [1, F, T]
             context_features = self.context_conv(c)
             context_features = F.relu(self.context_linear(context_features))
             
