@@ -77,14 +77,14 @@ class SGTN(nn.Module):
         
         # Trajectory prediction layers
         self.trajectory_predictor = nn.Sequential(
-            nn.Linear(self.graph_hidden + self.d_model, args.mlp_layer),
+            nn.Linear(self.graph_hidden + args.num_context_output_c, args.mlp_layer),
             nn.ReLU(),
             nn.Linear(args.mlp_layer, self.n_classes * self.input_size)
         )
         
         # Uncertainty estimation
         self.uncertainty_estimator = nn.Sequential(
-            nn.Linear(self.graph_hidden + self.d_model, args.mlp_layer),
+            nn.Linear(self.graph_hidden + args.num_context_output_c, args.mlp_layer),
             nn.ReLU(),
             nn.Linear(args.mlp_layer, self.n_classes * self.input_size * 2)  # Mean and variance
         )
@@ -105,12 +105,15 @@ class SGTN(nn.Module):
         
         for agent in range(batch_size):
             # Extract and embed individual trajectory
-            traj = torch.transpose(x[:, :, agent][None, :, :], 1, 2)
-            traj_embedded = self.input_embedding(traj)
+            traj = torch.transpose(x[:, :, agent][None, :, :], 1, 2)  # Shape: [1, T, F]
+            traj = traj.squeeze(0)  # Shape: [T, F]
+            traj_embedded = self.input_embedding(traj)  # Shape: [T, D]
+            traj_embedded = traj_embedded.unsqueeze(0)  # Shape: [1, T, D]
             traj_embedded = self.pos_encoder(traj_embedded)
             
             # Temporal encoding with Transformer
             temporal_encoding = self.transformer_encoder(traj_embedded)
+            temporal_encoding = temporal_encoding.mean(dim=1)  # Average over time dimension
             
             # Process context information
             c = torch.transpose(context[:, :, agent][None, :, :], 1, 2)
@@ -130,7 +133,7 @@ class SGTN(nn.Module):
             spatial_features = gnn_layer(spatial_features, adj)
             
         # Combine spatial and temporal features
-        combined_features = torch.cat([spatial_features, encoded_contexts], dim=-1)
+        combined_features = torch.cat([spatial_features, encoded_contexts.squeeze(1)], dim=-1)
         
         # Predict trajectories and uncertainties
         predicted_trajectories = self.trajectory_predictor(combined_features)
@@ -151,9 +154,12 @@ class SGTN(nn.Module):
         
         for agent in range(batch_size):
             traj = torch.transpose(x[:, :, agent][None, :, :], 1, 2)
+            traj = traj.squeeze(0)
             traj_embedded = self.input_embedding(traj)
+            traj_embedded = traj_embedded.unsqueeze(0)
             traj_embedded = self.pos_encoder(traj_embedded)
             temporal_encoding = self.transformer_encoder(traj_embedded)
+            temporal_encoding = temporal_encoding.mean(dim=1)
             
             c = torch.transpose(context[:, :, agent][None, :, :], 1, 2)
             context_features = self.context_conv(c)
@@ -169,7 +175,7 @@ class SGTN(nn.Module):
         for gnn_layer in self.gnn_layers:
             spatial_features = gnn_layer(spatial_features, adj)
             
-        combined_features = torch.cat([spatial_features, encoded_contexts], dim=-1)
+        combined_features = torch.cat([spatial_features, encoded_contexts.squeeze(1)], dim=-1)
         predicted_trajectories = self.trajectory_predictor(combined_features)
         predicted_trajectories = predicted_trajectories.view(-1, self.n_classes, self.input_size)
         
